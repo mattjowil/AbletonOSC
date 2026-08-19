@@ -90,7 +90,19 @@ class AbletonOSCHandler(Component):
             self.logger.info("Removing listener for %s %s, property %s" % (self.class_identifier, str(params), prop))
             listener_function = self.listener_functions[listener_key]
             remove_listener_function_name = "remove_%s_listener" % prop
-            remove_listener_function = getattr(target, remove_listener_function_name)
+            #--------------------------------------------------------------------------------
+            # PATCHED (Konversation vom 19.08.2026):
+            # Use the object that was actually stored at start_listen time, not the object
+            # passed in now. `target` is typically re-resolved from a track/clip/scene index
+            # on every call -- if that index has moved since the listener was registered
+            # (e.g. track dragged to a new position), `target` now points at a DIFFERENT
+            # object than the one the listener is actually bound to, and the removal call
+            # below would silently operate on the wrong object, leaving the real listener
+            # orphaned forever. Falling back to `target` only if nothing was stored, as a
+            # defensive measure.
+            #--------------------------------------------------------------------------------
+            remove_target = self.listener_objects.get(listener_key, target)
+            remove_listener_function = getattr(remove_target, remove_listener_function_name)
             try:
                 remove_listener_function(listener_function)
             except Exception as e:
