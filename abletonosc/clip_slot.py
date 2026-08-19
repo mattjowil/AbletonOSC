@@ -10,8 +10,25 @@ class ClipSlotHandler(AbletonOSCHandler):
         def create_clip_slot_callback(func, *args, pass_clip_index=False):
             def clip_slot_callback(params: Tuple[Any]):
                 track_index, clip_index = int(params[0]), int(params[1])
-                track = self.song.tracks[track_index]
-                clip_slot = track.clip_slots[clip_index]
+                #--------------------------------------------------------------------------------
+                # PATCHED (Konversation vom 19.08.2026):
+                # track_index/clip_index can be out of range if the track/scene count has
+                # shrunk since a listener was registered on this cell (e.g. a track was
+                # deleted). Previously this raised an unhandled IndexError here, before
+                # _stop_listen was ever reached -- meaning the original listener was never
+                # removed and a later start_listen on the same (now differently-occupied)
+                # cell left two live listeners bound to the same clip slot. Analogous to the
+                # fix in track.py::create_track_callback. _stop_listen (handler.py) no longer
+                # needs a valid clip_slot to remove the correct listener -- it uses the object
+                # stored at start_listen time -- so pass None through instead of crashing;
+                # other callbacks (get/set/methods, start_listen) will still fail on a None
+                # target, but gracefully, one level up.
+                #--------------------------------------------------------------------------------
+                try:
+                    track = self.song.tracks[track_index]
+                    clip_slot = track.clip_slots[clip_index]
+                except IndexError:
+                    clip_slot = None
 
                 if pass_clip_index:
                     rv = func(clip_slot, *args, tuple(params[0:]))
