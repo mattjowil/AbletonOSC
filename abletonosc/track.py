@@ -18,7 +18,22 @@ class TrackHandler(AbletonOSCHandler):
                     track_indices = [int(params[0])]
 
                 for track_index in track_indices:
-                    track = self.song.tracks[track_index]
+                    #--------------------------------------------------------------------------------
+                    # PATCHED (Konversation vom 19.08.2026):
+                    # track_index can be out of range if the track count has shrunk since a listener
+                    # was registered on it (e.g. a track was deleted). Previously this raised an
+                    # unhandled IndexError here, before _stop_listen/_stop_mixer_listen were ever
+                    # reached -- meaning the original listener was never removed and a later
+                    # start_listen on the same (now differently-occupied) index left two live
+                    # listeners bound to the same track. _stop_listen/_stop_mixer_listen no longer
+                    # need a valid `track` to remove the correct listener (see their patches), so
+                    # pass None through instead of crashing; other callbacks (get/set/start_listen)
+                    # will still fail on a None target, but gracefully, one level up.
+                    #--------------------------------------------------------------------------------
+                    try:
+                        track = self.song.tracks[track_index]
+                    except IndexError:
+                        track = None
                     if include_track_id:
                         rv = func(track, *args, tuple([track_index] + params[1:]))
                     else:
@@ -258,17 +273,63 @@ class TrackHandler(AbletonOSCHandler):
         parameter_object.add_value_listener(property_changed_callback)
         self.listener_functions[listener_key] = property_changed_callback
         #--------------------------------------------------------------------------------
+        # PATCHED (Konversation vom 19.08.2026):
+        # Store the actual mixer parameter object, so _stop_mixer_listen can remove the
+        # listener from the correct object later, even if `target` (the track, resolved
+        # fresh by index on every OSC call) has meanwhile moved to a different position.
+        #--------------------------------------------------------------------------------
+        self.listener_objects[listener_key] = parameter_object
+        #--------------------------------------------------------------------------------
         # Immediately send the current value
         #--------------------------------------------------------------------------------
         property_changed_callback()
 
     def _stop_mixer_listen(self, target, prop, params: Optional[Tuple[Any]] = ()) -> None:
-        parameter_object = getattr(target.mixer_device, prop)
         listener_key = (prop, tuple(params))
         if listener_key in self.listener_functions:
             self.logger.info("Removing listener for %s %s, property %s" % (self.class_identifier, str(params), prop))
             listener_function = self.listener_functions[listener_key]
-            parameter_object.remove_value_listener(listener_function)
+            #--------------------------------------------------------------------------------
+            # PATCHED (Konversation vom 19.08.2026):
+            # Use the stored parameter object rather than re-resolving `target.mixer_device.prop`
+            # fresh -- see _start_mixer_listen. `target` can be None here (see TrackHandler.clear_api
+            # below), so the fallback to getattr(target.mixer_device, prop) is only safe when a
+            # target was actually supplied; if not and nothing was stored, there's nothing we can do.
+            #--------------------------------------------------------------------------------
+            parameter_object = self.listener_objects.get(listener_key)
+            if parameter_object is None and target is not None:
+                parameter_object = getattr(target.mixer_device, prop)
+
+            if parameter_object is not None:
+                try:
+                    parameter_object.remove_value_listener(listener_function)
+                except Exception as e:
+                    #--------------------------------------------------------------------------------
+                    # May be thrown if the observer is no longer connected, e.g. the track
+                    # was deleted. Ignore as it is benign.
+                    #--------------------------------------------------------------------------------
+                    self.logger.info("Exception whilst removing listener (likely benign): %s" % e)
+            else:
+                self.logger.warning("Could not resolve parameter object to remove listener for: %s (%s)" % (prop, str(params)))
+
             del self.listener_functions[listener_key]
+            self.listener_objects.pop(listener_key, None)
         else:
             self.logger.warning("No listener function found for property: %s (%s)" % (prop, str(params)))
+
+    def clear_api(self):
+        #--------------------------------------------------------------------------------
+        # PATCHED (Konversation vom 19.08.2026):
+        # volume/panning listeners are tracked via _start_mixer_listen/_stop_mixer_listen,
+        # not the generic _start_listen/_stop_listen in the base class. Their remove-method
+        # is always "remove_value_listener" on the stored Parameter object, regardless of
+        # which mixer property it is -- the generic _clear_listeners() (base class) would
+        # instead try "remove_volume_listener"/"remove_panning_listener" on that Parameter
+        # object, which doesn't exist, and crash with an AttributeError. So: tear down mixer
+        # listeners here first, via the correct method, then let the base class handle the
+        # rest (name, playing_slot_index, arm, mute, solo, etc.) as normal.
+        #--------------------------------------------------------------------------------
+        mixer_keys = [key for key in list(self.listener_functions.keys()) if key[0] in ("volume", "panning")]
+        for prop, params in mixer_keys:
+            self._stop_mixer_listen(None, prop, params)
+        super().clear_api()
