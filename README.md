@@ -1,3 +1,120 @@
+# AbletonOSC Patch: Orphaned Listeners After Track Move/Deletion
+
+Date: 2026-08-19
+Affects: locally installed AbletonOSC copy (Remote Script), NOT the custom
+touchscreen controller server (`ableton_xy_pad_server_v2_9_0.py`).
+
+## Background
+
+After moving or deleting a track during an active Ableton session, old OSC
+listeners (especially `volume`) remained permanently active and kept reporting
+values under the frozen old track number. Visible symptoms in the controller:
+an extra neighboring column lights up on clip start, a volume fader moves the
+one next to it. Nothing went wrong in Ableton itself — this was purely
+misinformation caused by duplicate/misattributed messages.
+
+## Root Cause (confirmed in the AbletonOSC source code)
+
+Three related bugs in AbletonOSC itself (not in the custom server code):
+
+1. **`handler.py`, `_stop_listen`**: Resolves the target object each time a
+   listener is removed freshly via the current index (`self.song.tracks[i]`),
+   instead of using the object that was actually stored at registration time.
+   After a move, the index points to a different track — the removal attempt
+   hits the wrong object, and the actual (orphaned) listener stays active.
+
+2. **`track.py`, `_start_mixer_listen`/`_stop_mixer_listen`**: `volume` and
+   `panning` hang off `track.mixer_device`, not directly off `track`, and
+   therefore have their own separate listener mechanism instead of the generic
+   one from `handler.py`. This had the same bug as above, but additionally
+   **no error handling** on removal — a failed removal attempt left the
+   internal bookkeeping stuck, which also blocked subsequent re-registration.
+   In practice: after a move, the affected track sometimes got no new listener
+   at all, only the old one remained active.
+
+3. **`track.py`, `create_track_callback`**: With an index made invalid by track
+   deletion (the track count has shrunk), the index resolution crashed with an
+   `IndexError` before the listener-removal logic was even reached. As a
+   result, the old listener of the deleted track (or of the neighboring track
+   shifted by the deletion) was never removed, and a subsequent
+   re-registration created a second, parallel listener on the same physical
+   track.
+
+## The Changes in Detail
+
+### `handler.py`, method `_stop_listen`
+Before the actual removal call, it now first tries to use the object stored at
+`start_listen` (`self.listener_objects[listener_key]`); only if none exists
+does it fall back to the passed `target`. A one-line core change that fixes the
+bug for all properties running through the generic mechanism (including
+`name`, `playing_slot_index`, and all Clip/ClipSlot/Scene properties).
+
+### `track.py`, method `_start_mixer_listen`
+Additionally stores the actual mixer-parameter object in
+`self.listener_objects`, analogous to the generic mechanism.
+
+### `track.py`, method `_stop_mixer_listen`
+Now uses the stored parameter object instead of resolving it freshly, and
+catches errors on removal (try/except) instead of aborting the whole function
+on a failed removal attempt and leaving the bookkeeping inconsistent.
+
+### `track.py`, new method `clear_api`
+A dedicated override, because the generic cleanup function (`_clear_listeners`
+from `handler.py`, called among other things on `/live/api/reload`) would call
+the wrong method name for mixer listeners (`remove_volume_listener` doesn't
+exist on a parameter object — there it's called `remove_value_listener`) and
+would therefore have crashed. It cleans up mixer listeners first via the
+correct dedicated method, then the rest via the inherited method.
+
+### `track.py`, function `create_track_callback`
+Catches `IndexError` during index resolution and passes `None` through as the
+target object instead of crashing. For `stop_listen` calls this is harmless
+thanks to the changes above (they no longer need a valid object, just the
+stored reference); other calls (e.g. `get`/`set`/`start_listen`) fail with a
+harmless error caught further up, instead of a raw crash.
+
+## Confirmed by Four Test Runs in a Real Ableton Environment
+
+| Test | Checked | Result |
+|---|---|---|
+| Move + resync | reports the correct, current track number instead of the frozen old one | passed |
+| Reload with an active volume listener | `/live/api/reload` no longer crashes, interface stays responsive | passed |
+| Track deletion with an active listener | no duplicate listener binding on the shifted-up track | passed |
+| Two consecutive moves | no accumulation of ghost messages over multiple cycles | passed |
+
+## How to Reapply (important!)
+
+The patch modifies **local files in the installed AbletonOSC Remote Script**
+(`.../Remote Scripts/AbletonOSC/abletonosc/handler.py` and `.../track.py`),
+not the actual AbletonOSC repository. It is therefore lost as soon as:
+
+- AbletonOSC is re-downloaded/updated,
+- the Remote Script folders are reinstalled,
+- or a new Ableton installation is set up.
+
+**In any of these cases**: copy the two patched files (`handler.py`,
+`track.py` from this conversation) back into the `abletonosc/` folder before
+continuing to work with the custom server. If AbletonOSC has changed in the
+meantime (new version), simply overwriting may no longer be sufficient — in
+that case the three changes described above would need to be manually ported
+into the new version.
+
+## Deliberately Left Open / Not Part of This Patch
+
+- The similar effect described in GitHub issue #104 for
+  `/live/clip_slot/start_listen/has_clip` was not specifically retested —
+  no mixer mechanism is used there, so the effect could have a different
+  cause. Not relevant to the custom server, which does not currently use
+  `clip_slot` listeners.
+- The fundamental object-identity fix in `handler.py::_stop_listen` was only
+  tested in a real environment for `track`/`volume`/`panning`, not explicitly
+  for Clip, ClipSlot, or Scene properties — the fix applies there identically
+  based on the code, but this was not separately verified.
+
+##########################################################################################
+
+
+
 # AbletonOSC: Control Ableton Live with OSC
 
 [![stability-beta](https://img.shields.io/badge/stability-beta-33bbff.svg)](https://github.com/mkenney/software-guides/blob/master/STABILITY-BADGES.md#beta)
